@@ -3,21 +3,20 @@ import {
   X402_GATE_ENABLED,
   buildPaymentRequiredHeader,
   buildPaymentRequiredPayload,
-  buildPaymentResponseHeader,
-  verifyPayment,
   humanPrice
-} from "../x402";
-import { settleAuthorization, markSettled, SETTLER_ENABLED } from "../settle";
-import { scanImage, SCAN_MODE } from "@/lib/scan";
+} from "../challenge";
 import { urgencyOf } from "@/lib/status";
 import { DEFAULT_SETTINGS, Item } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
-// Expiri.ai "Expiry Scan" — the OKX.AI-registered ASP endpoint (A2MCP, paid).
-// An agent POSTs a product image; unpaid requests get an x402 challenge; a paid
-// request runs Claude vision and returns structured expiry data + an urgency
-// grade. GET and POST are both served because OKX's validator probes with POST
-// (a GET-only route answers its probe with a bare 405 and fails validation).
+// Expiri.ai "Expiry Scan" ASP endpoint (A2MCP, paid). GET and POST both served
+// because OKX's validator probes with POST, and a GET-only route answers its
+// probe with a bare 405 and fails.
+//
+// Cold-start discipline: this module statically imports ONLY the dependency-free
+// ./challenge layer. The unauthenticated 402 probe (the checker's first hit)
+// therefore loads no ethers / Anthropic SDK / Upstash and answers in ms. The
+// heavy modules are dynamically imported only once a payment proof is present.
 // ---------------------------------------------------------------------------
 
 export const maxDuration = 30;
@@ -36,20 +35,21 @@ function paymentRequired(resourceUrl: string, reason?: string) {
 
 // A settlement problem is ours, never the payer's — must not deny a paid call.
 async function settleVerified(
-  verification: Awaited<ReturnType<typeof verifyPayment>>
+  proof: { signature: string; authorization: { nonce: string } }
 ): Promise<{ status: "settled" | "pending" | "deferred"; txHash?: string }> {
-  if (!SETTLER_ENABLED || !verification.proof) {
-    if (!SETTLER_ENABLED) console.warn("x402: settler key not configured — payment verified but NOT collected.");
+  const { settleAuthorization, markSettled, SETTLER_ENABLED } = await import("../settle");
+  if (!SETTLER_ENABLED) {
+    console.warn("x402: settler key not configured — payment verified but NOT collected.");
     return { status: "deferred" };
   }
   try {
     const result = await settleAuthorization({
-      signature: verification.proof.signature,
-      authorization: verification.proof.authorization,
+      signature: proof.signature,
+      authorization: proof.authorization as never,
       receivedAt: Date.now()
     });
     if (result.ok && result.txHash) {
-      await markSettled(verification.proof.authorization.nonce, result.txHash);
+      await markSettled(proof.authorization.nonce, result.txHash);
       return { status: "settled", txHash: result.txHash };
     }
     if (result.alreadySettled) return { status: "settled" };
@@ -81,13 +81,12 @@ async function runScan(request: Request, extraHeaders: Record<string, string> = 
       { status: 400, headers: extraHeaders }
     );
   }
+  const { scanImage, SCAN_MODE } = await import("@/lib/scan");
   const result = await scanImage(img.base64, img.mediaType);
 
-  // Add an urgency grade if the scan produced a usable date.
   let urgency: string | null = null;
   if (result.expiryDate) {
-    const item = { expiryDate: result.expiryDate } as Item;
-    urgency = urgencyOf(item, DEFAULT_SETTINGS);
+    urgency = urgencyOf({ expiryDate: result.expiryDate } as Item, DEFAULT_SETTINGS);
   }
 
   return NextResponse.json({ result: { ...result, urgency }, mode: SCAN_MODE }, { headers: extraHeaders });
@@ -99,12 +98,13 @@ async function handle(request: Request) {
 
   if (X402_GATE_ENABLED) {
     const proofHeader = request.headers.get("PAYMENT-SIGNATURE") || request.headers.get("X-PAYMENT");
-    if (!proofHeader) return paymentRequired(resourceUrl);
+    if (!proofHeader) return paymentRequired(resourceUrl); // fast path — no heavy imports
 
+    const { verifyPayment, buildPaymentResponseHeader } = await import("../x402");
     const verification = await verifyPayment(proofHeader);
     if (!verification.verified) return paymentRequired(resourceUrl, `Payment rejected: ${verification.reason}`);
 
-    const settlement = await settleVerified(verification);
+    const settlement = verification.proof ? await settleVerified(verification.proof) : { status: "deferred" as const };
     return runScan(request, { "PAYMENT-RESPONSE": buildPaymentResponseHeader(verification, settlement) });
   }
 

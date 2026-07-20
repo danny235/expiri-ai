@@ -1,27 +1,24 @@
 import { ethers } from "ethers";
 import { redis } from "@/lib/redis";
+import {
+  CHAIN_ID,
+  PAYMENT_ASSET,
+  ASSET_DOMAIN_NAME,
+  ASSET_DOMAIN_VERSION,
+  NETWORK,
+  PRICE_ATOMIC,
+  PAY_TO,
+  humanPrice,
+  type Eip3009Authorization
+} from "./challenge";
 
 // ---------------------------------------------------------------------------
-// x402 pay-per-call gate (seller side) for the Expiri.ai "Expiry Scan" ASP.
-// Ported from the alphatrace implementation, verified against USD₮0 on X Layer:
-//   - `exact` scheme via EIP-3009 transferWithAuthorization
-//   - 6-check verifyPayment (recover, recipient, amount, window, replay, balance)
-//   - EIP-712 domain matches the live DOMAIN_SEPARATOR()
-// Redis keys are namespaced `expiri:x402:*` so this shares a DB cleanly.
+// x402 verification + settlement-side crypto (the ethers/redis-heavy half).
+// This module is imported dynamically from route.ts ONLY on a paid request, so
+// the unauthenticated 402 probe never pays its cold-start cost. Challenge
+// building lives in the dependency-free ./challenge module.
 // ---------------------------------------------------------------------------
 
-export const X402_GATE_ENABLED = process.env.X402_GATE_ENABLED === "true";
-
-const NETWORK = "eip155:196"; // X Layer
-const CHAIN_ID = 196;
-const PAYMENT_ASSET = "0x779ded0c9e1022225f8e0630b35a9b54be713736"; // USDT0 on X Layer
-const ASSET_DOMAIN_NAME = "USD" + String.fromCodePoint(0x20ae) + "0"; // "USD₮0"
-const ASSET_DOMAIN_VERSION = "1";
-const ASSET_DECIMALS = 6;
-
-const PRICE_ATOMIC = BigInt(process.env.X402_PRICE_ATOMIC || "200000"); // 0.2 USDT0
-const PAY_TO = (process.env.X402_PAY_TO || "0x643e96532de9e475ca1bc30c314216d25c59eef8").toLowerCase();
-const MAX_TIMEOUT_SECONDS = 3600;
 const XLAYER_RPC_URL = process.env.XLAYER_RPC_URL || "https://rpc.xlayer.tech";
 
 const EIP3009_TYPES = {
@@ -41,45 +38,6 @@ const EIP712_DOMAIN = {
   chainId: CHAIN_ID,
   verifyingContract: PAYMENT_ASSET
 };
-
-export function humanPrice(): string {
-  return `${ethers.formatUnits(PRICE_ATOMIC, ASSET_DECIMALS)} USDT0`;
-}
-
-const RESOURCE_DESCRIPTION =
-  "Scan a product image: returns the product name, expiry date (ISO), batch/lot number, quantity and an expiry-urgency assessment as structured JSON.";
-
-// x402 v2 challenge payload; `resource` carries url/description/mimeType per OKX's A2MCP spec.
-export function buildPaymentRequiredPayload(resourceUrl: string) {
-  return {
-    x402Version: 2,
-    resource: { url: resourceUrl, description: RESOURCE_DESCRIPTION, mimeType: "application/json" },
-    accepts: [
-      {
-        scheme: "exact",
-        network: NETWORK,
-        amount: PRICE_ATOMIC.toString(),
-        payTo: PAY_TO,
-        maxTimeoutSeconds: MAX_TIMEOUT_SECONDS,
-        asset: PAYMENT_ASSET,
-        extra: { name: ASSET_DOMAIN_NAME, version: ASSET_DOMAIN_VERSION }
-      }
-    ]
-  };
-}
-
-export function buildPaymentRequiredHeader(resourceUrl: string): string {
-  return Buffer.from(JSON.stringify(buildPaymentRequiredPayload(resourceUrl))).toString("base64");
-}
-
-export interface Eip3009Authorization {
-  from: string;
-  to: string;
-  value: string;
-  validAfter: string | number;
-  validBefore: string | number;
-  nonce: string;
-}
 
 export interface VerifyResult {
   verified: boolean;
